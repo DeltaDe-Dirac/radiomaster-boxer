@@ -209,8 +209,12 @@ local function bg_func()
     end
   end
 
-  -- New battery: pack voltage jumped up significantly vs last known
-  if packV and lastPackV and batteryUsed then
+  -- New battery: pack voltage jumped up significantly vs last known.
+  -- Only checked when NOT armed — you cannot physically swap a battery
+  -- while flying, so any voltage recovery during armed flight is sag
+  -- recovery after a crash, not a battery swap. Gating on not-armed
+  -- prevents resetBattery() (and timer reset) from firing on crashes.
+  if packV and lastPackV and batteryUsed and not armed then
     local perCellRise = cellCount and ((packV - lastPackV) / cellCount) or 0
     if perCellRise > CFG.newBattDelta then
       resetBattery()
@@ -238,18 +242,20 @@ local function bg_func()
     armed      = false
   end
 
-  -- ── Audio alerts (fire when battery present, not just when armed) ──
-  if cellV and cellV > 2.80 then
+  -- ── Audio/haptic alerts (only while armed / in-flight) ──
+  -- Never alert on the bench or after landing — only active flight matters.
+  if armed and cellV and cellV > 2.80 then
     local now = getTime()
 
     if cellV <= CFG.critV then
-      -- Critical: batctr.wav every 10s (takes priority, runs independently)
+      -- Critical: vibration + batcrt.wav every 10s
       if (now - lastCritTime) > critInterval then
+        playHaptic(100, 300)                            -- haptic vibration
         playFile("/SOUNDS/en/SCRIPTS/INAV/batcrt.wav")
         lastCritTime = now
         critAlerted  = true
       end
-      -- also keep warn timer alive so it does not re-trigger when going back up
+      -- keep warn timer alive so it does not re-trigger if voltage bounces up
       lastWarnTime = now
     elseif cellV <= CFG.warnV then
       -- Low battery: batlow.wav once then every 15s
@@ -263,7 +269,17 @@ local function bg_func()
 end
 
 -- ── Run ──────────────────────────────────────────────────────────
-local function run_func()
+local function run_func(event, touchState)
+  -- Manual timer reset: long-press ENTER while disarmed.
+  -- (Disarm guard prevents accidental in-flight reset.)
+  if event == EVT_VIRTUAL_ENTER_LONG and not armed then
+    flightTime   = 0
+    warnAlerted  = false
+    critAlerted  = false
+    lastWarnTime = 0
+    lastCritTime = 0
+  end
+
   lcd.clear()
 
   local W   = LCD_W
@@ -305,7 +321,8 @@ local function run_func()
     lcd.drawText(W - 24, 0, "ARM", SMLSIZE + INVERS)
   elseif ft > 0 then
     lcd.drawText(timerX, 0, fmtTime(ft), SMLSIZE)
-    lcd.drawText(W - 30, 0, "DONE", SMLSIZE)
+    lcd.drawText(W - 36, 0, "DONE", SMLSIZE)
+    lcd.drawText(W - 36, 8, "H:RST", SMLSIZE)  -- hint: hold ENTER to reset
   else
     lcd.drawText(timerX, 0, "0:00", SMLSIZE)
     lcd.drawText(W - 24, 0, "RDY", SMLSIZE)
