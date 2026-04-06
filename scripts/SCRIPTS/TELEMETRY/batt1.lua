@@ -181,17 +181,25 @@ end
 
 -- ── Background ───────────────────────────────────────────────────
 local function bg_func()
-  -- Read S1 knob for manual cell count override
+  -- S1 knob: 0 = AUTO, 1-6 = manual override
   local s1pos = readS1Cells()
-  if s1pos then
-    cellManual = s1pos   -- S1 always overrides auto-detect
+  if s1pos ~= nil and s1pos >= 1 then
+    -- Manual override — set both
+    cellManual = s1pos
     cellCount  = s1pos
+  elseif s1pos == 0 then
+    -- Switched back to AUTO — clear manual and cellCount so detection re-runs
+    if cellManual ~= nil then
+      cellManual = nil
+      cellCount  = nil
+    end
   end
+  -- s1pos == nil means getValue failed — leave state unchanged
 
   local packV = sensorGet(ID.voltage)
 
-  -- Auto-detect cell count once per battery (only if not manually set)
-  if packV and cellCount == nil and cellManual == nil then
+  -- Auto-detect only when not manually overridden and not yet detected
+  if packV and cellManual == nil and cellCount == nil then
     cellCount = detectCells(packV)
   end
 
@@ -209,12 +217,8 @@ local function bg_func()
     end
   end
 
-  -- New battery: pack voltage jumped up significantly vs last known.
-  -- Only checked when NOT armed — you cannot physically swap a battery
-  -- while flying, so any voltage recovery during armed flight is sag
-  -- recovery after a crash, not a battery swap. Gating on not-armed
-  -- prevents resetBattery() (and timer reset) from firing on crashes.
-  if packV and lastPackV and batteryUsed and not armed then
+  -- New battery: pack voltage jumped up significantly vs last known
+  if packV and lastPackV and batteryUsed then
     local perCellRise = cellCount and ((packV - lastPackV) / cellCount) or 0
     if perCellRise > CFG.newBattDelta then
       resetBattery()
@@ -242,16 +246,15 @@ local function bg_func()
     armed      = false
   end
 
-  -- ── Audio/haptic alerts (only while armed / in-flight) ──
-  -- Never alert on the bench or after landing — only active flight matters.
-  if armed and cellV and cellV > 2.80 then
+  -- ── Audio alerts (fire when battery present, not just when armed) ──
+  if cellV and cellV > 2.80 then
     local now = getTime()
 
     if cellV <= CFG.critV then
-      -- Critical: vibration + batcrt.wav every 10s
+      -- Critical: batctr.wav every 10s (takes priority, runs independently)
       if (now - lastCritTime) > critInterval then
-        playHaptic(100, 300)                            -- haptic vibration
         playFile("/SOUNDS/en/SCRIPTS/INAV/batcrt.wav")
+        playHaptic(500, 100, 3)  -- long strong buzz for critical
         lastCritTime = now
         critAlerted  = true
       end
@@ -269,17 +272,7 @@ local function bg_func()
 end
 
 -- ── Run ──────────────────────────────────────────────────────────
-local function run_func(event, touchState)
-  -- Manual timer reset: long-press ENTER while disarmed.
-  -- (Disarm guard prevents accidental in-flight reset.)
-  if event == EVT_VIRTUAL_ENTER_LONG and not armed then
-    flightTime   = 0
-    warnAlerted  = false
-    critAlerted  = false
-    lastWarnTime = 0
-    lastCritTime = 0
-  end
-
+local function run_func()
   lcd.clear()
 
   local W   = LCD_W
