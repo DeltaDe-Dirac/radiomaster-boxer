@@ -14,9 +14,9 @@ local CFG = {
     -- below this = standard LiPo (4.20V max)
     hvThresh = 4.22, -- cells resting above 4.22V = HV
 
-    -- Battery health thresholds (voltage sag per cell)
-    sagGood = 0.15, -- < 150mV sag = GOOD
-    sagOk = 0.30, -- < 300mV sag = OK / >= 300mV = WEAK
+    -- Capacity-health qualification thresholds
+    healthStartV = 4.15, -- first armed per-cell voltage must start at or above this
+    healthEndV = 3.30, -- lowest armed per-cell voltage must reach at or below this
 
     -- New battery detection
     newBattDelta = 0.20, -- per-cell voltage rise > 200mV = new battery
@@ -55,6 +55,16 @@ local CELL_BANDS = {
     { cells = 6, lo = 22.00, hi = 99.00 },
 }
 
+local COMMON_CAPS = { 300, 450, 500, 550, 650, 850, 1000, 1300, 1500, 2200, 3000 }
+local AUTO_CAP_BY_CELLS = {
+    [1] = 500,
+    [2] = 450,
+    [3] = 850,
+    [4] = 1500,
+    [5] = 2200,
+    [6] = 3000,
+}
+
 local function detectCells(packV)
     -- Use >= lo and < hi so boundaries are unambiguous
     for i = 1, #CELL_BANDS do
@@ -67,7 +77,7 @@ local function detectCells(packV)
 end
 
 -- ── Sensor IDs ───────────────────────────────────────────────────
-local ID = { voltage = -1, lq = -1, rssi1 = -1, rssi2 = -1, fm = -1 }
+local ID = { voltage = -1, current = -1, capa = -1, lq = -1, rssi1 = -1, rssi2 = -1, fm = -1 }
 
 -- ── State ────────────────────────────────────────────────────────
 local cellCount = nil   -- auto-detected or manually set
@@ -78,10 +88,18 @@ local armed = false
 local flightTime = 0
 local segStart = 0
 local startV = nil   -- per-cell voltage at first arm
-local minV = nil   -- lowest per-cell voltage seen
+local minFlightV = nil   -- lowest per-cell voltage seen while armed
 local lastPackV = nil   -- last known pack voltage (for new-batt detect)
 local batteryUsed = false
 local disconnectTime = nil  -- getTime() when packV first went nil this session
+local nominalMah = 500
+local startCapa = nil
+local usedMah = 0
+local usedMahEstimated = false
+local startedFull = false
+local lastCurrentTick = nil
+local baselineCellV = nil   -- best resting per-cell voltage seen for this pack
+local lastCapaSeen = nil
 
 -- Alert state
 local lastWarnTime = 0
@@ -134,6 +152,10 @@ local function fmtTime(secs)
     return string.format("%d:%02d", idiv(secs, 60), secs % 60)
 end
 
+local function fmtMah(v)
+    return tostring(math.floor(v + 0.5))
+end
+
 local function bestRSSI()
     local a = sensorGetAny(ID.rssi1)
     local b = sensorGetAny(ID.rssi2)
@@ -159,6 +181,10 @@ local function getFlightMode()
     return name
 end
 
+local function defaultNominalMah(cells)
+    return cells and AUTO_CAP_BY_CELLS[cells] or nil
+end
+
 local function isArmed()
     if ID.fm == -1 then
         return false
@@ -176,7 +202,7 @@ local function resetBattery()
     flightTime    = 0
     segStart      = 0
     startV        = nil
-    minV          = nil
+    minFlightV    = nil
     cellCount     = nil   -- re-detect on next battery
     hvLipo        = nil   -- re-detect HV on next battery
     batteryUsed   = false
@@ -185,11 +211,38 @@ local function resetBattery()
     lastWarnTime  = 0
     lastCritTime  = 0
     disconnectTime = nil  -- clear any pending disconnect tracking
+    startCapa     = nil
+    usedMah       = 0
+    usedMahEstimated = false
+    startedFull   = false
+    lastCurrentTick = nil
+    baselineCellV = nil
+    lastCapaSeen = nil
+end
+
+local function resetFlightSession()
+    armed = false
+    flightTime = 0
+    segStart = 0
+    startV = nil
+    minFlightV = nil
+    batteryUsed = false
+    warnAlerted = false
+    critAlerted = false
+    lastWarnTime = 0
+    lastCritTime = 0
+    startCapa = nil
+    usedMah = 0
+    usedMahEstimated = false
+    startedFull = false
+    lastCurrentTick = nil
 end
 
 -- ── Init ─────────────────────────────────────────────────────────
 local function init_func()
     ID.voltage = getTelemetryId("RxBt")
+    ID.current = getTelemetryId("Curr")
+    ID.capa = getTelemetryId("Capa")
     ID.lq = getTelemetryId("RQly")
     ID.rssi1 = getTelemetryId("1RSS")
     ID.rssi2 = getTelemetryId("2RSS")
@@ -211,6 +264,42 @@ local function readS1Cells()
     local offset = v > 0 and (v - 101) or (-v - 101)
     local cells = math.floor(offset / 154) % 6 + 1  -- 923/6=154 units per cell
     return cells
+end
+
+local function readS2Capacity()
+    local v = getValue("s2")
+    if type(v) ~= "number" then
+        return nil, nil
+    end
+    if v >= -100 and v <= 100 then
+        return "auto", nil
+    end
+    if v > 0 then
+        local span = 923 / #COMMON_CAPS
+        local idx = math.floor((v - 101) / span) + 1
+        idx = clamp(idx, 1, #COMMON_CAPS)
+        return "preset", COMMON_CAPS[idx]
+    end
+
+    local minMah = 100
+    local maxMah = 3000
+    local stepMah = 50
+    local steps = idiv(maxMah - minMah, stepMah) + 1
+    local span = 923 / steps
+    local idx = math.floor((-v - 101) / span)
+    idx = clamp(idx, 0, steps - 1)
+    return "linear", minMah + idx * stepMah
+end
+
+local function currentNominalLabel()
+    local capMode, capValue = readS2Capacity()
+    if capMode == "auto" then
+        return tostring(nominalMah)
+    end
+    if capValue then
+        return tostring(capValue) .. "*"
+    end
+    return tostring(nominalMah) .. "?"
 end
 
 -- ── Background ───────────────────────────────────────────────────
@@ -239,6 +328,16 @@ local function bg_func()
 
     local cellV = (packV and cellCount) and (packV / cellCount) or nil
 
+    local capMode, capValue = readS2Capacity()
+    if capMode == "auto" then
+        local autoMah = defaultNominalMah(cellCount)
+        if autoMah then
+            nominalMah = autoMah
+        end
+    elseif capValue then
+        nominalMah = capValue
+    end
+
     -- Auto-detect HV vs standard once per battery (use resting voltage)
     -- Only detect when not armed (no load) and cell count known
     if cellV and hvLipo == nil and not armed then
@@ -250,6 +349,17 @@ local function bg_func()
             maxV = 4.20
         end
     end
+
+    if cellV and not armed and (not batteryUsed or startV == nil) then
+        if baselineCellV == nil or cellV > baselineCellV then
+            baselineCellV = cellV
+        end
+    end
+
+    local capaNow = sensorGetAny(ID.capa)
+    local currNow = sensorGetAny(ID.current)
+    local now = getTime()
+    local prevCapaSeen = lastCapaSeen
 
     -- ── Battery swap detection (time-gated) ─────────────────────────
     -- Problem: a crash causes a brief power cut (<5s) then voltage recovers
@@ -265,48 +375,82 @@ local function bg_func()
         end
     else
         if disconnectTime ~= nil then
-            -- Power just returned — evaluate whether this is a new battery
+            -- Power just returned — only reset if it looks like a fresh pack,
+            -- not the same battery recovering from sag after a telemetry drop.
             local outSecs    = idiv(getTime() - disconnectTime, 100)
-            local perCellRise = (lastPackV and cellCount)
-                            and ((packV - lastPackV) / cellCount) or 0
-            if outSecs >= CFG.battSwapMinS and perCellRise > CFG.newBattDelta then
-                -- Confirmed swap: long absence + higher voltage = fresh battery
+            local returnCells = cellManual or cellCount or detectCells(packV)
+            local returnCellV = returnCells and (packV / returnCells) or nil
+            local cellsChanged = (cellCount ~= nil and returnCells ~= nil and returnCells ~= cellCount)
+            local capaReset = (capaNow ~= nil and prevCapaSeen ~= nil and capaNow + 25 < prevCapaSeen)
+            local freshEnough = returnCellV ~= nil and returnCellV >= CFG.healthStartV
+            local aboveBaseline = baselineCellV ~= nil and returnCellV ~= nil
+                    and returnCellV >= (baselineCellV + 0.05)
+            local swapDetected = cellsChanged or capaReset or (ID.capa == -1 and freshEnough and aboveBaseline)
+            if outSecs >= CFG.battSwapMinS and swapDetected then
                 resetBattery()
                 cellCount = detectCells(packV)
                 cellV     = cellCount and (packV / cellCount) or nil
+                baselineCellV = cellV
             end
             disconnectTime = nil
         end
         if packV > 0 then lastPackV = packV end
     end
 
-    -- Track min cell voltage
-    if cellV and cellV > CFG.armV then
-        if minV == nil or cellV < minV then
-            minV = cellV
-        end
+    if capaNow ~= nil then
+        lastCapaSeen = capaNow
     end
 
     -- Arm/disarm
     local nowArmed = isArmed()
     if nowArmed and not armed then
         armed = true
-        segStart = getTime()
+        segStart = now
         if startV == nil and cellV then
             startV = cellV
+            startedFull = cellV >= CFG.healthStartV
         end
+        if minFlightV == nil and cellV and cellV > CFG.armV then
+            minFlightV = cellV
+        end
+        if startCapa == nil and capaNow ~= nil then
+            startCapa = capaNow
+            usedMahEstimated = false
+        elseif startCapa == nil then
+            usedMahEstimated = true
+        end
+        lastCurrentTick = now
         batteryUsed = true
     elseif not nowArmed and armed then
-        flightTime = flightTime + idiv(getTime() - segStart, 100)
+        flightTime = flightTime + idiv(now - segStart, 100)
         armed = false
+        lastCurrentTick = nil
+    end
+
+    if armed then
+        if cellV and cellV > CFG.armV then
+            if minFlightV == nil or cellV < minFlightV then
+                minFlightV = cellV
+            end
+        end
+
+        if capaNow ~= nil and startCapa ~= nil then
+            usedMah = math.max(0, capaNow - startCapa)
+            usedMahEstimated = false
+        elseif currNow ~= nil and currNow > 0 and lastCurrentTick ~= nil then
+            local dt = now - lastCurrentTick
+            if dt > 0 then
+                usedMah = usedMah + (currNow * dt) / 360
+                usedMahEstimated = true
+            end
+        end
+        lastCurrentTick = now
     end
 
     -- ── Audio/haptic alerts (armed / in-flight only) ─────────────────
     -- Never alert on the bench or post-landing. The FC's disarm signal
     -- (trailing * in FM) clears the `armed` flag, stopping all alerts.
     if armed and cellV and cellV > 2.80 then
-        local now = getTime()
-
         if cellV <= CFG.critV then
             -- Critical: haptic vibration + batcrt.wav every 10s
             if (now - lastCritTime) > critInterval then
@@ -333,11 +477,7 @@ local function run_func(event, touchState)
     -- Manual timer reset: long-press ENTER while disarmed.
     -- Disarm guard makes accidental in-flight reset impossible.
     if event == EVT_VIRTUAL_ENTER_LONG and not armed then
-        flightTime   = 0
-        warnAlerted  = false
-        critAlerted  = false
-        lastWarnTime = 0
-        lastCritTime = 0
+        resetFlightSession()
     end
 
     lcd.clear()
@@ -349,6 +489,8 @@ local function run_func(event, touchState)
 
     local packV = sensorGet(ID.voltage)
     local cellV = (packV and cellCount) and (packV / cellCount) or nil
+    local capaNow = sensorGetAny(ID.capa)
+    local currNow = sensorGetAny(ID.current)
     local lq = sensorGetAny(ID.lq)
     local rssi = bestRSSI()
     local pct = voltPct(cellV)
@@ -387,7 +529,7 @@ local function run_func(event, touchState)
     local hvStr   = hvLipo == true and "HV" or (hvLipo == false and "ST" or "?")
     local manStr  = cellManual and "*" or ""
     local cellStr = cellCount and (cellCount .. "S" .. manStr) or "?S"
-    lcd.drawText(0, 0, cellStr .. " " .. hvStr, SMLSIZE + INVERS)
+    lcd.drawText(0, 0, cellStr .. " " .. hvStr .. " " .. currentNominalLabel(), SMLSIZE + INVERS)
 
     local timerX = idiv(W, 2) - 12
     local fmName = getFlightMode()  -- e.g. "ACRO", "HOR", "ANGL", "FAIL", ""
@@ -417,7 +559,7 @@ local function run_func(event, touchState)
 
     lcd.drawLine(0, 9, W - 1, 9, SOLID, 0)
     lcd.drawLine(mid, 9, mid, H - 1, SOLID, 0)
-    lcd.drawLine(mid, 44, W - 1, 44, DOTTED, 0)
+    lcd.drawLine(mid, 34, W - 1, 34, DOTTED, 0)
 
     -- ── Left: Voltage ────────────────────────────────────────────
     lcd.drawText(2, 11, "BATTERY", SMLSIZE)
@@ -446,30 +588,54 @@ local function run_func(event, touchState)
     end
 
     -- ── Right top: Link ───────────────────────────────────────────
-    lcd.drawText(c2, 11, "LINK RQly", SMLSIZE)
+    lcd.drawText(c2, 11, "LINK", SMLSIZE)
     if lq then
-        lcd.drawText(c2, 20, string.format("%d%%", lq), MIDSIZE + lf(lq))
-        if rssi then
-            lcd.drawText(c2, 36, string.format("%ddBm", math.floor(rssi)), SMLSIZE)
-        end
+        local linkText = rssi and string.format("%d%% %ddBm", lq, math.floor(rssi))
+                or string.format("%d%%", lq)
+        lcd.drawText(c2, 20, linkText, SMLSIZE + lf(lq))
     else
         lcd.drawText(c2, 20, "NO LNK", SMLSIZE + INVERS + BLINK)
     end
 
     -- ── Right bottom: Health ──────────────────────────────────────
-    lcd.drawText(c2, 46, "HEALTH:", SMLSIZE)
-    if startV and minV and batteryUsed then
-        local sag = startV - minV
-        local sagMv = math.floor(sag * 1000)
-        local rating = sag < CFG.sagGood and "GOOD"
-                or sag < CFG.sagOk and "OK"
-                or "WEAK"
-        local hf = sag >= CFG.sagOk and INVERS or 0
-        lcd.drawText(c2, 55, rating .. " " .. sagMv .. "mV", SMLSIZE + hf)
-    elseif armed then
-        lcd.drawText(c2, 55, "sampling...", SMLSIZE)
+    lcd.drawText(c2, 37, "HEALTH:", SMLSIZE)
+    local hasCapa = capaNow ~= nil or startCapa ~= nil
+    local hasCurr = currNow ~= nil
+    local healthQualified = batteryUsed and nominalMah > 0 and startedFull
+            and minFlightV ~= nil and minFlightV <= CFG.healthEndV
+    if batteryUsed and (hasCapa or usedMahEstimated or hasCurr) then
+        local usedStr = fmtMah(usedMah) .. "/" .. nominalMah
+        local flags = 0
+        local line1
+        local line2
+        if healthQualified then
+            local healthPct = clamp(math.floor((usedMah / nominalMah) * 100 + 0.5), 0, 999)
+            line1 = healthPct .. "% -"
+            line2 = usedStr .. "mAh"
+            if healthPct < 80 then
+                flags = INVERS
+            end
+        elseif hasCapa or hasCurr then
+            line1 = usedMahEstimated and "EST -" or "USED -"
+            line2 = usedStr .. "mAh"
+        else
+            line1 = "NO CURR"
+            flags = INVERS
+        end
+        lcd.drawText(c2, 45, line1, SMLSIZE + flags)
+        if line2 then
+            lcd.drawText(c2, 53, line2, SMLSIZE + flags)
+        end
+    elseif ID.capa == -1 and ID.current == -1 then
+        lcd.drawText(c2, 49, "NO CAPA", SMLSIZE + INVERS)
+    elseif ID.capa == -1 then
+        lcd.drawText(c2, 45, "CURR ONLY", SMLSIZE)
+        lcd.drawText(c2, 53, "ESTIMATE", SMLSIZE)
+    elseif ID.current == -1 then
+        lcd.drawText(c2, 45, "CAPA ONLY", SMLSIZE)
+        lcd.drawText(c2, 53, "READY", SMLSIZE)
     else
-        lcd.drawText(c2, 55, "---", SMLSIZE)
+        lcd.drawText(c2, 49, "---", SMLSIZE)
     end
 
     return 0
