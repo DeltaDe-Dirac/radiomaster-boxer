@@ -20,6 +20,8 @@ local CFG = {
 
     -- New battery detection
     newBattDelta = 0.20, -- per-cell voltage rise > 200mV = new battery
+    battSwapMinS = 15,   -- minimum seconds disconnected to count as a swap
+                         -- crash cuts are usually <5s; a real swap takes ≥15s
 
     -- Link quality
     lqWarn = 70,
@@ -79,6 +81,7 @@ local startV = nil   -- per-cell voltage at first arm
 local minV = nil   -- lowest per-cell voltage seen
 local lastPackV = nil   -- last known pack voltage (for new-batt detect)
 local batteryUsed = false
+local disconnectTime = nil  -- getTime() when packV first went nil this session
 
 -- Alert state
 local lastWarnTime = 0
@@ -140,6 +143,22 @@ local function bestRSSI()
     return a or b
 end
 
+-- Returns the clean flight mode name (no trailing *, abbreviated to ≤4 chars).
+-- Returns "" when sensor is unavailable.
+local function getFlightMode()
+    if ID.fm == -1 then return "" end
+    local v = getValue(ID.fm)
+    if type(v) ~= "string" or v == "" then return "" end
+    -- Strip trailing * (disarmed marker used by Betaflight CRSF telemetry)
+    local name = (string.sub(v, -1) == "*") and string.sub(v, 1, -2) or v
+    if name == ""         then return "" end
+    if name == "HORIZON"  then return "HOR"  end
+    if name == "ANGLE"    then return "ANGL" end
+    if name == "FAILSAFE" then return "FAIL" end
+    if #name > 4          then return string.sub(name, 1, 4) end
+    return name
+end
+
 local function isArmed()
     if ID.fm == -1 then
         return false
@@ -153,18 +172,19 @@ local function isArmed()
 end
 
 local function resetBattery()
-    armed = false
-    flightTime = 0
-    segStart = 0
-    startV = nil
-    minV = nil
-    cellCount = nil  -- re-detect on next battery
-    hvLipo = nil  -- re-detect HV on next battery
-    batteryUsed = false
-    warnAlerted = false
-    critAlerted = false
-    lastWarnTime = 0
-    lastCritTime = 0
+    armed         = false
+    flightTime    = 0
+    segStart      = 0
+    startV        = nil
+    minV          = nil
+    cellCount     = nil   -- re-detect on next battery
+    hvLipo        = nil   -- re-detect HV on next battery
+    batteryUsed   = false
+    warnAlerted   = false
+    critAlerted   = false
+    lastWarnTime  = 0
+    lastCritTime  = 0
+    disconnectTime = nil  -- clear any pending disconnect tracking
 end
 
 -- ── Init ─────────────────────────────────────────────────────────
@@ -231,18 +251,33 @@ local function bg_func()
         end
     end
 
-    -- New battery: pack voltage jumped up significantly vs last known
-    if packV and lastPackV and batteryUsed then
-        local perCellRise = cellCount and ((packV - lastPackV) / cellCount) or 0
-        if perCellRise > CFG.newBattDelta then
-            resetBattery()
-            cellCount = detectCells(packV)  -- re-detect immediately
-            cellV = packV and cellCount and (packV / cellCount) or nil
+    -- ── Battery swap detection (time-gated) ─────────────────────────
+    -- Problem: a crash causes a brief power cut (<5s) then voltage recovers
+    -- (sag clears) which would trip a naive voltage-rise check.
+    -- Solution: require the battery to have been absent for at least
+    -- CFG.battSwapMinS seconds AND the per-cell voltage to be higher.
+    -- You cannot physically swap a battery in <15s, so this cleanly
+    -- separates real swaps from crash reconnects.
+    if packV == nil then
+        -- Power lost — start the disconnect clock (once per absence)
+        if batteryUsed and disconnectTime == nil then
+            disconnectTime = getTime()
         end
-    end
-
-    if packV and packV > 0 then
-        lastPackV = packV
+    else
+        if disconnectTime ~= nil then
+            -- Power just returned — evaluate whether this is a new battery
+            local outSecs    = idiv(getTime() - disconnectTime, 100)
+            local perCellRise = (lastPackV and cellCount)
+                            and ((packV - lastPackV) / cellCount) or 0
+            if outSecs >= CFG.battSwapMinS and perCellRise > CFG.newBattDelta then
+                -- Confirmed swap: long absence + higher voltage = fresh battery
+                resetBattery()
+                cellCount = detectCells(packV)
+                cellV     = cellCount and (packV / cellCount) or nil
+            end
+            disconnectTime = nil
+        end
+        if packV > 0 then lastPackV = packV end
     end
 
     -- Track min cell voltage
@@ -266,33 +301,45 @@ local function bg_func()
         armed = false
     end
 
-    -- ── Audio alerts (fire when battery present, not just when armed) ──
-    if cellV and cellV > 2.80 then
+    -- ── Audio/haptic alerts (armed / in-flight only) ─────────────────
+    -- Never alert on the bench or post-landing. The FC's disarm signal
+    -- (trailing * in FM) clears the `armed` flag, stopping all alerts.
+    if armed and cellV and cellV > 2.80 then
         local now = getTime()
 
         if cellV <= CFG.critV then
-            -- Critical: batctr.wav every 10s (takes priority, runs independently)
+            -- Critical: haptic vibration + batcrt.wav every 10s
             if (now - lastCritTime) > critInterval then
+                playHaptic(100, 300)  -- strength=100, duration=300ms
                 playFile("/SOUNDS/en/SCRIPTS/INAV/batcrt.wav")
-                playHaptic(500, 100, 3)  -- long strong buzz for critical
                 lastCritTime = now
-                critAlerted = true
+                critAlerted  = true
             end
             -- keep warn timer alive so it does not re-trigger if voltage bounces up
             lastWarnTime = now
         elseif cellV <= CFG.warnV then
-            -- Low battery: batlow.wav once then every 15s
+            -- Low: batlow.wav once then every 15s
             if not warnAlerted or (now - lastWarnTime) > warnInterval then
                 playFile("/SOUNDS/en/SCRIPTS/INAV/batlow.wav")
                 lastWarnTime = now
-                warnAlerted = true
+                warnAlerted  = true
             end
         end
     end
 end
 
 -- ── Run ──────────────────────────────────────────────────────────
-local function run_func()
+local function run_func(event, touchState)
+    -- Manual timer reset: long-press ENTER while disarmed.
+    -- Disarm guard makes accidental in-flight reset impossible.
+    if event == EVT_VIRTUAL_ENTER_LONG and not armed then
+        flightTime   = 0
+        warnAlerted  = false
+        critAlerted  = false
+        lastWarnTime = 0
+        lastCritTime = 0
+    end
+
     lcd.clear()
 
     local W = LCD_W
@@ -337,22 +384,35 @@ local function run_func()
     end
 
     -- ── Header ───────────────────────────────────────────────────
-    local hvStr = hvLipo == true and "HV" or (hvLipo == false and "ST" or "?")
-    local manStr = cellManual and "*" or ""  -- * = manually set
+    local hvStr   = hvLipo == true and "HV" or (hvLipo == false and "ST" or "?")
+    local manStr  = cellManual and "*" or ""
     local cellStr = cellCount and (cellCount .. "S" .. manStr) or "?S"
     lcd.drawText(0, 0, cellStr .. " " .. hvStr, SMLSIZE + INVERS)
+
     local timerX = idiv(W, 2) - 12
+    local fmName = getFlightMode()  -- e.g. "ACRO", "HOR", "ANGL", "FAIL", ""
+
+    -- Helper: draw state label then flight mode immediately to its left.
+    -- Each SMLSIZE char is ~6px wide; this gives a right-aligned mode+state pair.
+    local function drawModeState(stateStr, stateFlags)
+        local stateX = W - #stateStr * 6 - 2
+        lcd.drawText(stateX, 0, stateStr, SMLSIZE + stateFlags)
+        if fmName ~= "" then
+            local mf = (fmName == "FAIL") and (INVERS + BLINK) or 0
+            lcd.drawText(stateX - #fmName * 6 - 3, 0, fmName, SMLSIZE + mf)
+        end
+    end
+
     if armed then
         local bl = (idiv(getTime(), 100) % 2 == 0) and INVERS or 0
         lcd.drawText(timerX, 0, fmtTime(ft), SMLSIZE + bl)
-        lcd.drawText(W - 24, 0, "ARM", SMLSIZE + INVERS)
+        drawModeState("ARM", INVERS)
     elseif ft > 0 then
         lcd.drawText(timerX, 0, fmtTime(ft), SMLSIZE)
-        lcd.drawText(W - 36, 0, "DONE", SMLSIZE)
-        lcd.drawText(W - 36, 8, "H:RST", SMLSIZE)  -- hint: hold ENTER to reset
+        drawModeState("DONE", 0)
     else
         lcd.drawText(timerX, 0, "0:00", SMLSIZE)
-        lcd.drawText(W - 24, 0, "RDY", SMLSIZE)
+        drawModeState("RDY", 0)
     end
 
     lcd.drawLine(0, 9, W - 1, 9, SOLID, 0)
