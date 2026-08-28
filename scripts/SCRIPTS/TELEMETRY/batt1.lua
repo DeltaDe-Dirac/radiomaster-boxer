@@ -1,4 +1,4 @@
--- FPVStats v5.0 - RadioMaster Boxer B&W · EdgeTX · ELRS
+-- FPVStats v5.1 - RadioMaster Boxer B&W · EdgeTX · ELRS
 -- Generic: auto-detects 1S-6S LiPo/HV LiPo
 --
 -- Install: SD card → SCRIPTS/TELEMETRY/fpvstats.lua
@@ -361,40 +361,15 @@ local function bg_func()
     local now = getTime()
     local prevCapaSeen = lastCapaSeen
 
-    -- ── Battery swap detection (time-gated) ─────────────────────────
-    -- Problem: a crash causes a brief power cut (<5s) then voltage recovers
-    -- (sag clears) which would trip a naive voltage-rise check.
-    -- Solution: require the battery to have been absent for at least
-    -- CFG.battSwapMinS seconds AND the per-cell voltage to be higher.
-    -- You cannot physically swap a battery in <15s, so this cleanly
-    -- separates real swaps from crash reconnects.
-    if packV == nil then
-        -- Power lost — start the disconnect clock (once per absence)
-        if batteryUsed and disconnectTime == nil then
-            disconnectTime = getTime()
-        end
-    else
-        if disconnectTime ~= nil then
-            -- Power just returned — only reset if it looks like a fresh pack,
-            -- not the same battery recovering from sag after a telemetry drop.
-            local outSecs    = idiv(getTime() - disconnectTime, 100)
-            local returnCells = cellManual or cellCount or detectCells(packV)
-            local returnCellV = returnCells and (packV / returnCells) or nil
-            local cellsChanged = (cellCount ~= nil and returnCells ~= nil and returnCells ~= cellCount)
-            local capaReset = (capaNow ~= nil and prevCapaSeen ~= nil and capaNow + 25 < prevCapaSeen)
-            local freshEnough = returnCellV ~= nil and returnCellV >= CFG.healthStartV
-            local aboveBaseline = baselineCellV ~= nil and returnCellV ~= nil
-                    and returnCellV >= (baselineCellV + 0.05)
-            local swapDetected = cellsChanged or capaReset or (ID.capa == -1 and freshEnough and aboveBaseline)
-            if outSecs >= CFG.battSwapMinS and swapDetected then
-                resetBattery()
-                cellCount = detectCells(packV)
-                cellV     = cellCount and (packV / cellCount) or nil
-                baselineCellV = cellV
-            end
-            disconnectTime = nil
-        end
-        if packV > 0 then lastPackV = packV end
+    -- ── Battery swap detection (Voltage-based) ────────────────────
+    -- Reset only when not armed, battery was previously used, and we detect
+    -- a voltage that meets the "fresh battery" threshold (healthStartV).
+    -- This prevents resets during disarm, RX loss, or brief power cuts.
+    if not armed and batteryUsed and cellV and minFlightV ~= nil and minFlightV < (CFG.healthStartV - 0.15) and cellV >= CFG.healthStartV then
+        resetBattery()
+        cellCount = detectCells(packV)
+        cellV = cellCount and (packV / cellCount) or nil
+        baselineCellV = cellV
     end
 
     if capaNow ~= nil then
@@ -529,13 +504,20 @@ local function run_func(event, touchState)
     local hvStr   = hvLipo == true and "HV" or (hvLipo == false and "ST" or "?")
     local manStr  = cellManual and "*" or ""
     local cellStr = cellCount and (cellCount .. "S" .. manStr) or "?S"
-    lcd.drawText(0, 0, cellStr .. " " .. hvStr .. " " .. currentNominalLabel(), SMLSIZE + INVERS)
+    local leftLabel = cellStr .. " " .. hvStr .. " " .. currentNominalLabel()
+    lcd.drawText(0, 0, leftLabel, SMLSIZE + INVERS)
 
-    local timerX = idiv(W, 2) - 12
+    -- Calculate dynamic timer position to prevent overlap
+    local leftWidth = #leftLabel * 6 + 4
+    local timerStr = armed and fmtTime(ft) or (ft > 0 and fmtTime(ft) or "0:00")
+    local timerWidth = #timerStr * 6
+    
+    -- Center the timer, but ensure it stays at least 6px away from the left label
+    local timerX = math.max(leftWidth + 6, idiv(W, 2) - idiv(timerWidth, 2))
+    
     local fmName = getFlightMode()  -- e.g. "ACRO", "HOR", "ANGL", "FAIL", ""
 
     -- Helper: draw state label then flight mode immediately to its left.
-    -- Each SMLSIZE char is ~6px wide; this gives a right-aligned mode+state pair.
     local function drawModeState(stateStr, stateFlags)
         local stateX = W - #stateStr * 6 - 2
         lcd.drawText(stateX, 0, stateStr, SMLSIZE + stateFlags)
@@ -543,17 +525,23 @@ local function run_func(event, touchState)
             local mf = (fmName == "FAIL") and (INVERS + BLINK) or 0
             lcd.drawText(stateX - #fmName * 6 - 3, 0, fmName, SMLSIZE + mf)
         end
+        return stateX
     end
+
+    -- Ensure timer doesn't overlap the right-side state label
+    local stateX = W - (armed and # "ARM" or (ft > 0 and # "DONE" or # "RDY")) * 6 - 2
+    local rightBound = stateX - (#fmName * 6 + 3)
+    timerX = math.min(timerX, rightBound - timerWidth - 6)
 
     if armed then
         local bl = (idiv(getTime(), 100) % 2 == 0) and INVERS or 0
-        lcd.drawText(timerX, 0, fmtTime(ft), SMLSIZE + bl)
+        lcd.drawText(timerX, 0, timerStr, SMLSIZE + bl)
         drawModeState("ARM", INVERS)
     elseif ft > 0 then
-        lcd.drawText(timerX, 0, fmtTime(ft), SMLSIZE)
+        lcd.drawText(timerX, 0, timerStr, SMLSIZE)
         drawModeState("DONE", 0)
     else
-        lcd.drawText(timerX, 0, "0:00", SMLSIZE)
+        lcd.drawText(timerX, 0, timerStr, SMLSIZE)
         drawModeState("RDY", 0)
     end
 
